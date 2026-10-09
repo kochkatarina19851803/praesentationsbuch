@@ -26,8 +26,7 @@ jobs:
           distribution: temurin
           java-version: "21"
 
-      - name: Android-Werkzeuge vorbereiten
-        uses: android-actions/setup-android@v3
+
 
       - name: Android SDK installieren
         run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
