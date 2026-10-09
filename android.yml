@@ -1,0 +1,87 @@
+name: Android-App erstellen
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Projekt laden
+        uses: actions/checkout@v4
+
+      - name: Node.js vorbereiten
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Java vorbereiten
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: App-Dateien prüfen
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in package.json capacitor.config.json www/index.html; do
+            if [ ! -f "$file" ]; then
+              echo "::error::Die erforderliche Datei $file fehlt."
+              exit 1
+            fi
+          done
+
+      - name: Android-Werkzeuge vorbereiten
+        uses: android-actions/setup-android@v3
+        with:
+          log-accepted-android-sdk-licenses: false
+          packages: ""
+
+      - name: Android SDK installieren
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+      - name: Abhängigkeiten installieren
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Android-Projekt vorbereiten
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -d android ]; then
+            npx cap add android
+          fi
+          npx cap sync android
+
+      - name: APK bauen
+        working-directory: android
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: APK zum Download bereitstellen
+        uses: actions/upload-artifact@v4
+        with:
+          name: Praesentationsbuch-Android
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30
