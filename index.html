@@ -1,0 +1,515 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#175c50">
+<title>Präsentationsbuch</title>
+<link rel="manifest" href="./manifest.webmanifest">
+<style>
+:root{font:16px system-ui,sans-serif;color:#19372f;background:#f3f6f3}
+*{box-sizing:border-box}
+body{margin:0}
+header{background:#175c50;color:white;padding:24px 18px}
+header>div,main{max-width:850px;margin:auto}
+h1{font-size:1.6rem;margin:0 0 6px}
+h2{font-size:1.3rem}
+h3{margin:0;font-size:1.05rem}
+p{line-height:1.5}
+main{padding:18px 14px 60px}
+button,input,textarea,select{font:inherit}
+button{cursor:pointer;min-height:44px;padding:10px 14px;border:1px solid #cad8d0;border-radius:12px;background:white;color:#19372f}
+button.primary{background:#175c50;color:white;border-color:#175c50}
+button.danger{color:#a32929}
+button:disabled{opacity:.45;cursor:default}
+input,textarea,select{width:100%;padding:12px;border:1px solid #bdcdc3;border-radius:10px;background:white;color:#19372f}
+textarea{min-height:95px;resize:vertical}
+label{display:block;margin:12px 0}
+label>span{display:block;margin-bottom:6px}
+.card{background:white;border:1px solid #dce5df;border-radius:18px;padding:18px;margin:14px 0}
+.row{display:flex;gap:9px;align-items:center;flex-wrap:wrap}
+.between{justify-content:space-between}
+.stack{display:grid;gap:10px}
+.muted{color:#5d7267;font-size:.9rem}
+.badge{display:inline-block;padding:5px 10px;border-radius:20px;background:#edf2ef;font-size:.85rem}
+.good{background:#dff2e7;color:#1b6544}
+.wait{background:#fff0ce;color:#85580b}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:18px 0}
+.stats div{background:#e6eee8;border-radius:12px;padding:12px}
+.stats strong{display:block;font-size:1.4rem}
+progress{width:100%;accent-color:#175c50;height:9px}
+.linkcard{width:100%;text-align:left;padding:18px}
+.linkcard strong{display:block;margin-bottom:5px}
+.history{padding-left:20px;line-height:1.7}
+.error{padding:12px;background:#ffe4e4;color:#8c2525;border-radius:10px}
+.notice{padding:12px;background:#e5eee9;border-radius:10px}
+dialog{border:0;border-radius:18px;padding:24px;width:min(94vw,480px);max-height:90vh;overflow:auto;color:#19372f}
+dialog::backdrop{background:#16312888}
+:focus-visible{outline:3px solid #ca8b2a;outline-offset:3px}
+#toast{position:fixed;bottom:15px;left:50%;transform:translateX(-50%);background:#19372f;color:white;padding:12px 18px;border-radius:12px;max-width:92vw;z-index:5}
+@media(max-width:420px){.stats div{padding:9px}.card{padding:14px}button{padding:10px}}
+</style>
+</head>
+<body>
+<header><div>
+<h1>Präsentationsbuch</h1>
+<div>Deine B2-Gruppen. Alle Schritte im Blick.</div>
+</div></header>
+<main id="app"></main>
+<dialog id="modal"></dialog>
+<div id="toast" role="status" hidden></div>
+<input id="importFile" type="file" accept=".json,application/json" hidden>
+<script>
+'use strict';
+
+const KEY='praesentationsbuch-v1';
+const app=document.querySelector('#app');
+const modal=document.querySelector('#modal');
+let state, loadError='', storageError='', toastTimer;
+let view={group:null,person:null,settings:false,filter:'all'};
+const labels={
+  submission:'Version abgegeben',
+  revision:'Überarbeitung',
+  approval:'Freigegeben',
+  talk:'Präsentation gehalten'
+};
+const esc=v=>String(v).replace(/[&<>"']/g,c=>({
+  '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+}[c]));
+const id=()=>crypto.randomUUID();
+const today=()=>{
+  const d=new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+};
+const dateLabel=d=>new Intl.DateTimeFormat('de-DE').format(new Date(d+'T12:00:00'));
+const empty=()=>({
+  version:1,
+  topics:Array.from({length:8},(_,i)=>`Thema ${i+1}`),
+  groups:[]
+});
+const newPresentation=()=>({notes:'',events:[]});
+
+function status(p){
+  let submitted=false,pending=false,approved=false;
+  let revisions=0,talks=0,submissions=0;
+  for(const e of p.events){
+    if(e.type==='submission'){
+      submitted=true;pending=false;approved=false;submissions++;
+    }else if(e.type==='revision'){
+      pending=true;approved=false;revisions++;
+    }else if(e.type==='approval'){
+      approved=true;pending=false;
+    }else if(e.type==='talk'){
+      talks++;
+    }
+  }
+  const next=!submitted?'Erste Version abgeben'
+    :pending?'Neue Version abgeben'
+    :!approved?'Prüfen / freigeben'
+    :talks===0?'Vortrag halten':'Weitere Vorträge möglich';
+  return {submitted,pending,approved,revisions,talks,submissions,next};
+}
+
+function validDate(d){
+  if(typeof d!=='string'||!/^\d{4}-\d{2}-\d{2}$/.test(d))return false;
+  const parsed=new Date(d+'T12:00:00Z');
+  return !isNaN(parsed)&&parsed.toISOString().slice(0,10)===d;
+}
+
+function normalize(raw){
+  if(!raw||raw.version!==1||!Array.isArray(raw.topics)||
+     raw.topics.length!==8||!Array.isArray(raw.groups))throw Error('Ungültiges Format.');
+  const text=(v,max)=>{
+    if(typeof v!=='string'||v.length>max)throw Error('Ungültiger Text.');
+    return v;
+  };
+  const ids=new Set();
+  const checkedId=v=>{
+    if(typeof v!=='string'||v.length<1||v.length>100||ids.has(v))throw Error('Ungültige Kennung.');
+    ids.add(v);return v;
+  };
+  if(raw.groups.length>500)throw Error('Zu viele Gruppen.');
+  return {
+    version:1,
+    topics:raw.topics.map(t=>{
+      const v=text(t,120).trim();
+      if(!v)throw Error('Ein Thema ist leer.');
+      return v;
+    }),
+    groups:raw.groups.map(g=>{
+      if(!g||!Array.isArray(g.people)||g.people.length>1000)throw Error('Ungültige Gruppe.');
+      const name=text(g.name,120).trim();
+      if(!name)throw Error('Ein Gruppenname ist leer.');
+      return {
+        id:checkedId(g.id),name,
+        people:g.people.map(p=>{
+          if(!p||!Array.isArray(p.presentations)||p.presentations.length!==8)throw Error('Ungültige Person.');
+          const name=text(p.name,120).trim();
+          if(!name)throw Error('Ein Name ist leer.');
+          return {
+            id:checkedId(p.id),name,
+            presentations:p.presentations.map(pr=>{
+              if(!pr||!Array.isArray(pr.events)||pr.events.length>10000)throw Error('Ungültiger Verlauf.');
+              const result={notes:text(pr.notes,10000),events:[]};
+              for(const e of pr.events){
+                if(!e||!Object.hasOwn(labels,e.type)||!validDate(e.date))throw Error('Ungültiger Eintrag.');
+                const s=status(result);
+                if(e.type==='revision'&&(!s.submitted||s.pending))throw Error('Überarbeitung ohne verfügbare Version.');
+                if(e.type==='approval'&&(!s.submitted||s.pending||s.approved))throw Error('Ungültige Freigabe.');
+                if(e.type==='talk'&&!s.approved)throw Error('Vortrag ohne Freigabe.');
+                result.events.push({
+                  type:e.type,date:e.date,note:text(e.note??'',1000)
+                });
+              }
+              return result;
+            })
+          };
+        })
+      };
+    })
+  };
+}
+
+try{
+  const saved=localStorage.getItem(KEY);
+  state=saved?normalize(JSON.parse(saved)):empty();
+}catch(e){
+  state=empty();
+  loadError='Die gespeicherten Daten konnten nicht geladen werden. Sie werden nicht überschrieben. Du kannst die Rohdaten sichern oder eine gültige Sicherung wiederherstellen.';
+}
+
+function notify(message){
+  const t=document.querySelector('#toast');
+  t.textContent=message;t.hidden=false;
+  clearTimeout(toastTimer);
+  toastTimer=setTimeout(()=>t.hidden=true,3500);
+}
+
+// Commit only after the complete new state has been saved.
+function commit(change){
+  if(loadError){notify('Bitte zuerst die Daten wiederherstellen.');return false;}
+  const next=structuredClone(state);
+  change(next);
+  try{
+    localStorage.setItem(KEY,JSON.stringify(next));
+    state=next;storageError='';return true;
+  }catch(e){
+    storageError='Die Änderung wurde nicht gespeichert. Der Gerätespeicher ist voll oder der Browser blockiert die Speicherung.';
+    render();notify('Speichern fehlgeschlagen.');return false;
+  }
+}
+const group=()=>state.groups.find(g=>g.id===view.group);
+const person=()=>group()?.people.find(p=>p.id===view.person);
+const findPerson=(data)=>data.groups.find(g=>g.id===view.group)?.people.find(p=>p.id===view.person);
+const stats=people=>{
+  const all=people.flatMap(p=>p.presentations.map(status));
+  return {
+    total:all.length,
+    delivered:all.filter(s=>s.submitted).length,
+    held:all.filter(s=>s.talks>0).length,
+    open:all.filter(s=>s.talks===0||!s.approved).length
+  };
+};
+const statsHtml=s=>`<div class="stats">
+  <div><strong>${s.delivered}/${s.total}</strong><small>abgegeben</small></div>
+  <div><strong>${s.held}/${s.total}</strong><small>mind. 1× gehalten</small></div>
+  <div><strong>${s.open}</strong><small>offene Themen</small></div>
+</div>`;
+function button(action,text,extra='',cls=''){
+  return `<button class="${cls}" data-action="${action}" ${extra}>${text}</button>`;
+}
+function matches(s){
+  return view.filter==='all'
+    ||view.filter==='open'&&(s.talks===0||!s.approved)
+    ||view.filter==='submission'&&(!s.submitted||s.pending)
+    ||view.filter==='review'&&(s.submitted&&!s.pending&&!s.approved)
+    ||view.filter==='ready'&&(s.approved&&s.talks===0)
+    ||view.filter==='held'&&s.talks>0;
+}
+function filterHtml(){
+  const options=[
+    ['all','Alle Themen'],['open','Offene Themen'],
+    ['submission','Abgabe fehlt'],['review','Prüfen / freigeben'],
+    ['ready','Vortrag ausstehend'],['held','Schon gehalten']
+  ];
+  return `<label><span>Ansicht filtern</span><select id="filter">
+    ${options.map(([value,label])=>`<option value="${value}" ${view.filter===value?'selected':''}>${label}</option>`).join('')}
+  </select></label>`;
+}
+
+function presentationHtml(pr,i){
+  const s=status(pr);
+  return `<article class="card">
+    <div class="row between">
+      <h3>${esc(state.topics[i])}</h3>
+      <span class="badge ${s.approved?'good':'wait'}">${esc(s.next)}</span>
+    </div>
+    <p class="muted">${s.submissions} Abgaben · ${s.revisions} Überarbeitungen · ${s.talks} Vorträge</p>
+    <div class="row">
+      ${button('event','Abgabe erfassen',`data-index="${i}" data-type="submission"`)}
+      ${button('event','Überarbeitet',`data-index="${i}" data-type="revision" ${!s.submitted||s.pending?'disabled':''}`)}
+      ${button('event','Freigeben',`data-index="${i}" data-type="approval" ${!s.submitted||s.pending||s.approved?'disabled':''}`)}
+      ${button('event','Vortrag erfassen',`data-index="${i}" data-type="talk" ${!s.approved?'disabled':''}`,'primary')}
+    </div>
+    <details style="margin-top:16px">
+      <summary>Notizen und Verlauf (${pr.events.length})</summary>
+      <p>${pr.notes?esc(pr.notes).replace(/\n/g,'<br>'):'Keine Notizen vorhanden.'}</p>
+      ${button('notes','Notizen bearbeiten',`data-index="${i}"`)}
+      ${pr.events.length?`
+        <ol class="history">
+          ${pr.events.map(e=>`<li>${esc(dateLabel(e.date))}: ${labels[e.type]}${e.note?` — ${esc(e.note)}`:''}</li>`).join('')}
+        </ol>
+        ${button('undo','Letzten Eintrag rückgängig machen',`data-index="${i}"`)}
+      `:'<p class="muted">Noch keine Einträge.</p>'}
+    </details>
+  </article>`;
+}
+
+function render(){
+  if(view.group&&!group()){view.group=null;view.person=null;}
+  if(view.person&&!person())view.person=null;
+  let content=`<div class="row between">
+    ${button('home','Gruppen')}
+    ${button('settings','Themen & Sicherung')}
+  </div>`;
+  if(loadError)content+=`<p class="error">${esc(loadError)}</p>`;
+  if(storageError)content+=`<p class="error" role="alert">${esc(storageError)}</p>`;
+  if(view.settings){
+    content+=`<h2>Themen & Sicherung</h2>
+      <section class="card">
+        <p>Diese acht Themen gelten für alle Personen. Umbenennen erhält die bisherigen Einträge.</p>
+        <form id="topicsForm">
+          ${state.topics.map((t,i)=>`<label><span>Thema ${i+1}</span><input name="topic${i}" value="${esc(t)}" maxlength="120" required></label>`).join('')}
+          <button class="primary" ${loadError?'disabled':''}>Themen speichern</button>
+        </form>
+      </section>
+      <section class="card">
+        <h3>Deine Daten sichern</h3>
+        <p>Alle Angaben bleiben in diesem Browser. Sichere sie regelmäßig: Gelöschte Browserdaten oder eine andere Webadresse können den Zugriff auf die lokalen Daten verlieren lassen.</p>
+        <div class="row">
+          ${button('export',loadError?'Gespeicherte Rohdaten sichern':'Sicherung herunterladen')}
+          ${button('import','Sicherung wiederherstellen')}
+        </div>
+      </section>
+      <p class="muted">Android: In Chrome über das Menü „Zum Startbildschirm hinzufügen“ oder „App installieren“. Offline-Nutzung steht nach erfolgreicher Vorbereitung bereit.</p>
+      <p id="offlineStatus" class="muted"></p>`;
+  }else if(person()){
+    const p=person();
+    content+=`<p>${button('back','← '+esc(group().name))}</p>
+      <div class="row between"><h2>${esc(p.name)}</h2>
+      <div class="row">${button('renamePerson','Umbenennen')}${button('deletePerson','Entfernen','','danger')}</div></div>
+      ${statsHtml(stats([p]))}
+      ${filterHtml()}`;
+    const visible=p.presentations.map((pr,i)=>({pr,i})).filter(x=>matches(status(x.pr)));
+    content+=visible.length?visible.map(x=>presentationHtml(x.pr,x.i)).join(''):'<p class="notice">Keine Themen für diesen Filter.</p>';
+  }else if(group()){
+    const g=group();
+    content+=`<div class="row between"><h2>${esc(g.name)}</h2>
+      <div class="row">${button('renameGroup','Umbenennen')}${button('deleteGroup','Entfernen','','danger')}</div></div>
+      ${statsHtml(stats(g.people))}
+      ${button('addPerson','+ Person hinzufügen','','primary')}
+      ${filterHtml()}
+      <div class="stack" style="margin-top:16px">`;
+    const visible=g.people.filter(p=>p.presentations.some(pr=>matches(status(pr))));
+    content+=visible.map(p=>{
+      const s=stats([p]);
+      const pending=p.presentations.filter(pr=>{
+        const x=status(pr);return !x.submitted||x.pending;
+      }).length;
+      return `<button class="linkcard" data-action="person" data-id="${esc(p.id)}">
+        <strong>${esc(p.name)}</strong>
+        <div class="muted">${s.held}/8 Themen gehalten · ${pending} Abgaben offen</div>
+        <progress max="8" value="${s.held}" aria-label="${esc(p.name)}: ${s.held} von 8 Themen gehalten"></progress>
+      </button>`;
+    }).join('');
+    content+=`</div>${!visible.length?'<p class="notice">Noch keine Personen oder keine Treffer für diesen Filter.</p>':''}`;
+  }else{
+    content+=`<h2>Meine Gruppen</h2>
+      ${statsHtml(stats(state.groups.flatMap(g=>g.people)))}
+      ${button('addGroup','+ Gruppe anlegen','','primary')}
+      <div class="stack" style="margin-top:16px">`;
+    content+=state.groups.map(g=>{
+      const s=stats(g.people);
+      return `<button class="linkcard" data-action="group" data-id="${esc(g.id)}">
+        <strong>${esc(g.name)}</strong>
+        <span class="muted">${g.people.length} Personen · ${s.open} offene Themen</span>
+      </button>`;
+    }).join('');
+    content+=`</div>${!state.groups.length?'<section class="card"><h3>Mit deiner ersten Gruppe starten</h3><p>Lege eine Gruppe an und füge ihre Teilnehmenden hinzu. Jede Person erhält automatisch acht Themen.</p></section>':''}`;
+  }
+  app.innerHTML=content;
+  updateOfflineLabel();
+}
+
+function openForm(title,fields,onSave,submit='Speichern'){
+  modal.innerHTML=`<form id="dialogForm">
+    <h2>${esc(title)}</h2>${fields}
+    <div class="row" style="margin-top:20px">
+      <button class="primary">${esc(submit)}</button>
+      <button type="button" id="cancel">Abbrechen</button>
+    </div>
+  </form>`;
+  modal.querySelector('#cancel').onclick=()=>modal.close();
+  modal.querySelector('form').onsubmit=e=>{
+    e.preventDefault();
+    const data=new FormData(e.target);
+    if(onSave(data)!==false){modal.close();render();}
+  };
+  modal.showModal();
+}
+function nameForm(title,value,onSave){
+  openForm(title,`<label><span>Name</span><input name="name" value="${esc(value)}" maxlength="120" required autofocus></label>`,data=>{
+    const name=data.get('name').trim();
+    if(!name){notify('Bitte einen Namen eingeben.');return false;}
+    return onSave(name);
+  });
+}
+function download(content,name){
+  const url=URL.createObjectURL(new Blob([content],{type:'application/json'}));
+  const a=document.createElement('a');a.href=url;a.download=name;
+  document.body.append(a);a.click();a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
+
+app.addEventListener('click',e=>{
+  const b=e.target.closest('button[data-action]');
+  if(!b)return;
+  const action=b.dataset.action;
+  const i=Number(b.dataset.index);
+  if(action==='home'){
+    view={group:null,person:null,settings:false,filter:'all'};
+  }else if(action==='settings'){
+    view.settings=true;
+  }else if(action==='back'){
+    view.person=null;view.filter='all';
+  }else if(action==='group'){
+    view.group=b.dataset.id;view.person=null;view.settings=false;view.filter='all';
+  }else if(action==='person'){
+    view.person=b.dataset.id;
+  }else if(action==='addGroup'){
+    nameForm('Gruppe anlegen','',name=>commit(s=>s.groups.push({id:id(),name,people:[]})));
+    return;
+  }else if(action==='addPerson'){
+    nameForm('Person hinzufügen','',name=>commit(s=>{
+      s.groups.find(g=>g.id===view.group).people.push({
+        id:id(),name,presentations:Array.from({length:8},newPresentation)
+      });
+    }));return;
+  }else if(action==='renameGroup'){
+    nameForm('Gruppe umbenennen',group().name,name=>commit(s=>s.groups.find(g=>g.id===view.group).name=name));return;
+  }else if(action==='renamePerson'){
+    nameForm('Person umbenennen',person().name,name=>commit(s=>findPerson(s).name=name));return;
+  }else if(action==='deleteGroup'){
+    if(!confirm(`Gruppe „${group().name}“ mit allen Personen und Einträgen entfernen? Bitte bei Bedarf vorher eine Sicherung herunterladen.`))return;
+    if(commit(s=>s.groups=s.groups.filter(g=>g.id!==view.group))){
+      view.group=null;view.person=null;
+    }
+  }else if(action==='deletePerson'){
+    if(!confirm(`„${person().name}“ mit allen Präsentationseinträgen entfernen?`))return;
+    if(commit(s=>{
+      const g=s.groups.find(g=>g.id===view.group);
+      g.people=g.people.filter(p=>p.id!==view.person);
+    }))view.person=null;
+  }else if(action==='notes'){
+    openForm('Notizen',`<label><span>Notizen zu ${esc(state.topics[i])}</span><textarea name="notes" maxlength="10000">${esc(person().presentations[i].notes)}</textarea></label>`,data=>
+      commit(s=>findPerson(s).presentations[i].notes=data.get('notes'))
+    );return;
+  }else if(action==='event'){
+    const type=b.dataset.type;
+    const hint=type==='revision'
+      ?'<p>Danach bleibt „Neue Version abgeben“ offen. Eine vorhandene Freigabe wird aufgehoben.</p>'
+      :type==='submission'
+      ?'<p>Die eingegangene Version kann anschließend geprüft und freigegeben werden.</p>'
+      :type==='talk'
+      ?'<p>Jeder Vortrag wird einzeln gespeichert. Weitere Vorträge bleiben möglich.</p>'
+      :'';
+    openForm(labels[type],`
+      <p>${esc(person().name)} · ${esc(state.topics[i])}</p>${hint}
+      <label><span>Datum</span><input type="date" name="date" value="${today()}" required></label>
+      <label><span>Bemerkung (optional)</span><textarea name="note" maxlength="1000"></textarea></label>
+    `,data=>{
+      if(!validDate(data.get('date'))){notify('Bitte ein gültiges Datum eingeben.');return false;}
+      return commit(s=>findPerson(s).presentations[i].events.push({
+        type,date:data.get('date'),note:data.get('note').trim()
+      }));
+    },'Eintragen');return;
+  }else if(action==='undo'){
+    if(!confirm('Den zuletzt erfassten Eintrag entfernen? Der vorherige Status wird wiederhergestellt.'))return;
+    commit(s=>findPerson(s).presentations[i].events.pop());
+  }else if(action==='export'){
+    try{
+      const data=loadError?localStorage.getItem(KEY):JSON.stringify(state,null,2);
+      if(!data){notify('Keine gespeicherten Daten vorhanden.');return;}
+      download(data,`praesentationsbuch-${today()}.json`);
+    }catch(e){notify('Die Daten konnten nicht gelesen werden.');}
+    return;
+  }else if(action==='import'){
+    document.querySelector('#importFile').click();return;
+  }
+  render();
+});
+app.addEventListener('change',e=>{
+  if(e.target.id==='filter'){view.filter=e.target.value;render();}
+});
+app.addEventListener('submit',e=>{
+  if(e.target.id!=='topicsForm')return;
+  e.preventDefault();
+  const data=new FormData(e.target);
+  const topics=Array.from({length:8},(_,i)=>data.get(`topic${i}`).trim());
+  if(topics.some(t=>!t)){notify('Bitte alle acht Themen benennen.');return;}
+  if(commit(s=>s.topics=topics)){notify('Themen gespeichert.');render();}
+});
+
+document.querySelector('#importFile').addEventListener('change',async e=>{
+  const file=e.target.files[0];e.target.value='';
+  if(!file)return;
+  if(file.size>10*1024*1024){notify('Die Sicherung ist größer als 10 MB.');return;}
+  let restored;
+  try{restored=normalize(JSON.parse(await file.text()));}
+  catch(error){notify('Diese Datei ist keine gültige Sicherung.');return;}
+  if(!confirm('Diese Sicherung ersetzt alle aktuell gespeicherten Gruppen und Einträge. Fortfahren?'))return;
+  try{
+    localStorage.setItem(KEY,JSON.stringify(restored));
+    state=restored;loadError='';storageError='';
+    view={group:null,person:null,settings:false,filter:'all'};
+    render();notify('Sicherung wiederhergestellt.');
+  }catch(error){notify('Wiederherstellen fehlgeschlagen: Speicherung nicht möglich.');}
+});
+
+// Avoid overwriting changes made in another open browser tab.
+window.addEventListener('storage',e=>{
+  if(e.key!==KEY)return;
+  try{
+    state=e.newValue?normalize(JSON.parse(e.newValue)):empty();
+    loadError='';storageError='';render();
+    notify('Daten aus einem anderen Fenster übernommen.');
+  }catch(error){
+    loadError='Die Daten aus einem anderen Fenster sind ungültig. Bitte eine Sicherung wiederherstellen.';
+    render();
+  }
+});
+
+let offlineMessage='Offline-Nutzung wird vorbereitet …';
+function updateOfflineLabel(){
+  const el=document.querySelector('#offlineStatus');
+  if(el)el.textContent=offlineMessage;
+}
+render();
+if('serviceWorker' in navigator&&window.isSecureContext){
+  navigator.serviceWorker.register('./sw.js')
+    .then(()=>navigator.serviceWorker.ready)
+    .then(()=>{
+      offlineMessage='Die App ist für Offline-Nutzung vorbereitet.';
+      updateOfflineLabel();
+    })
+    .catch(()=>{
+      offlineMessage='Offline-Vorbereitung fehlgeschlagen. Prüfe, ob alle drei Dateien über HTTPS erreichbar sind, und lade die App erneut.';
+      updateOfflineLabel();
+    });
+}else{
+  offlineMessage='Offline-Nutzung benötigt HTTPS oder einen lokalen Testserver auf localhost.';
+  updateOfflineLabel();
+}
+</script>
+</body>
+</html>
